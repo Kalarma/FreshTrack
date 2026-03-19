@@ -731,12 +731,20 @@
 
 <!-- Bottom nav -->
 <div class="bottom-nav">
-  <div class="nav-hint">💡 Entre le code-barres ou scanne un produit • Données sauvegardées localement</div>
+  <div class="nav-hint">💡 Entre le code-barres ou scanne un produit • Données & notifs sauvegardées</div>
 </div>
 
 <script>
 // ============ STATE ============
-let products = JSON.parse(localStorage.getItem('freshtrack_products') || '[]');
+const STORAGE_KEY = 'freshtrack_v2_products';
+let products = [];
+try {
+  // Migrate from v1 if needed
+  const old = localStorage.getItem('freshtrack_products');
+  const v2  = localStorage.getItem(STORAGE_KEY);
+  if (v2) products = JSON.parse(v2);
+  else if (old) { products = JSON.parse(old); localStorage.removeItem('freshtrack_products'); save(); }
+} catch { products = []; }
 let currentTab = 'all';
 let pendingProduct = null;
 let cameraStream = null;
@@ -744,7 +752,7 @@ let barcodeScanner = null;
 
 // ============ UTILS ============
 function save() {
-  localStorage.setItem('freshtrack_products', JSON.stringify(products));
+  try { localStorage.setItem(STORAGE_KEY, JSON.stringify(products)); } catch {}
 }
 
 function getDaysLeft(dateStr) {
@@ -975,6 +983,8 @@ function addProduct() {
   render();
   closeModal();
   showToast(`✓ ${name} ajouté au frigo !`);
+  // Re-check notifs (in case this was an urgent product)
+  checkAndNotifyIfNeeded();
 }
 
 function deleteProduct(id) {
@@ -1064,30 +1074,73 @@ function closeCamera() {
 }
 
 // ============ NOTIFICATIONS ============
+const NOTIF_KEY = 'freshtrack_last_notif';
+
 async function requestNotifications() {
-  if ('Notification' in window && Notification.permission === 'default') {
-    await Notification.requestPermission();
-  }
+  if (!('Notification' in window)) return false;
+  if (Notification.permission === 'granted') return true;
+  if (Notification.permission === 'denied') return false;
+  const result = await Notification.requestPermission();
+  return result === 'granted';
 }
 
-function checkAndNotify() {
-  if (!('Notification' in window) || Notification.permission !== 'granted') return;
-
-  const urgent = products.filter(p => {
+function buildNotifBody() {
+  const urgent = products.filter(p => { const d = getDaysLeft(p.expiry); return d >= 0 && d <= 2; });
+  const today  = products.filter(p => getDaysLeft(p.expiry) === 0);
+  if (urgent.length === 0) return null;
+  const lines = urgent.map(p => {
     const d = getDaysLeft(p.expiry);
-    return d >= 0 && d <= 2;
+    return `• ${p.name} — ${d === 0 ? "aujourd'hui !" : d === 1 ? 'demain' : `${d}j`}`;
   });
-
-  if (urgent.length > 0) {
-    new Notification('🧊 FreshTrack — Produits à consommer vite !', {
-      body: urgent.map(p => `• ${p.name}`).join('\n'),
-      icon: 'data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><text y=".9em" font-size="90">🧊</text></svg>'
-    });
-  }
+  return { title: `🧊 ${urgent.length} produit${urgent.length > 1 ? 's' : ''} à consommer vite`, body: lines.join('\n') };
 }
 
-// Request notif permission on load
-requestNotifications();
+function fireNotification() {
+  if (Notification.permission !== 'granted') return;
+  const n = buildNotifBody();
+  if (!n) return;
+  try {
+    const notif = new Notification(n.title, {
+      body: n.body,
+      icon: 'data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><text y=".9em" font-size="90">🧊</text></svg>',
+      badge: 'data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><text y=".9em" font-size="90">❄️</text></svg>',
+      tag: 'freshtrack-urgent',
+      renotify: true
+    });
+    notif.onclick = () => { window.focus(); notif.close(); };
+    localStorage.setItem(NOTIF_KEY, Date.now().toString());
+  } catch {}
+}
+
+function checkAndNotifyIfNeeded() {
+  if (products.length === 0) return;
+  const last = parseInt(localStorage.getItem(NOTIF_KEY) || '0');
+  const hoursSince = (Date.now() - last) / 3600000;
+  // Fire if never notified, or last notif was more than 20h ago
+  if (hoursSince > 20) fireNotification();
+}
+
+// Schedule a daily check at 9:00
+function scheduleDailyCheck() {
+  const now = new Date();
+  const next9 = new Date(now);
+  next9.setHours(9, 0, 0, 0);
+  if (next9 <= now) next9.setDate(next9.getDate() + 1);
+  const msUntil9 = next9 - now;
+  setTimeout(() => {
+    fireNotification();
+    setInterval(fireNotification, 24 * 3600 * 1000); // then every 24h
+  }, msUntil9);
+}
+
+// Init notifications on load
+(async () => {
+  const granted = await requestNotifications();
+  if (granted) {
+    checkAndNotifyIfNeeded(); // fire immediately if needed
+    scheduleDailyCheck();     // schedule for 9h daily
+  }
+})();
 
 // ============ INIT ============
 render();
@@ -1099,20 +1152,7 @@ document.addEventListener('keydown', (e) => {
   }
 });
 
-// Demo products if first launch
-if (products.length === 0) {
-  const today = new Date();
-  const demo = [
-    { id: '1', name: 'Yaourt nature Danone', brand: 'Danone', category: '🧀 Produits laitiers', qty: 4, expiry: new Date(today.getTime() + 2*86400000).toISOString().split('T')[0], addedAt: today.toISOString() },
-    { id: '2', name: 'Poulet rôti', brand: '', category: '🥩 Viandes & poissons', qty: 1, expiry: new Date(today.getTime() + 1*86400000).toISOString().split('T')[0], addedAt: today.toISOString() },
-    { id: '3', name: 'Lait demi-écrémé', brand: 'Lactel', category: '🧀 Produits laitiers', qty: 1, expiry: new Date(today.getTime() + 8*86400000).toISOString().split('T')[0], addedAt: today.toISOString() },
-    { id: '4', name: 'Tomates cerises', brand: '', category: '🥦 Légumes & fruits', qty: 1, expiry: new Date(today.getTime() + 4*86400000).toISOString().split('T')[0], addedAt: today.toISOString() },
-    { id: '5', name: 'Camembert', brand: 'Président', category: '🧀 Produits laitiers', qty: 1, expiry: new Date(today.getTime() - 1*86400000).toISOString().split('T')[0], addedAt: today.toISOString() },
-  ];
-  products = demo;
-  save();
-  render();
-}
+// Start fresh — no demo products
 </script>
 </body>
 </html>
