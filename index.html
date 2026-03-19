@@ -6,6 +6,7 @@
 <title>FreshTrack — Mon Frigo</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=DM+Sans:ital,wght@0,300;0,400;0,500;1,300&display=swap" rel="stylesheet">
+<script src="https://cdn.jsdelivr.net/npm/@zxing/library@0.20.0/umd/index.min.js"></script>
 
 <style>
   :root {
@@ -635,7 +636,7 @@
   <div class="scan-bar">
     <div class="scan-input-wrap">
       <span class="icon-left">🔍</span>
-      <input type="text" id="barcode-input" placeholder="Code-barres ou nom produit…" inputmode="numeric">
+      <input type="text" id="barcode-input" placeholder="Code-barres ou nom produit…">
     </div>
     <button class="btn-scan" onclick="openCamera()" title="Scanner avec la caméra">📷</button>
   </div>
@@ -748,7 +749,6 @@ try {
 let currentTab = 'all';
 let pendingProduct = null;
 let cameraStream = null;
-let barcodeScanner = null;
 
 // ============ UTILS ============
 function save() {
@@ -1025,51 +1025,82 @@ document.getElementById('barcode-input').addEventListener('input', function() {
   }
 });
 
-// ============ CAMERA ============
+// ============ CAMERA (ZXing — iOS compatible) ============
+let zxingReader = null;
+
 async function openCamera() {
   const modal = document.getElementById('camera-modal');
   modal.classList.add('open');
 
-  try {
-    cameraStream = await navigator.mediaDevices.getUserMedia({
-      video: { facingMode: 'environment' }
-    });
-    document.getElementById('camera-video').srcObject = cameraStream;
+  const video = document.getElementById('camera-video');
 
-    // Try to use BarcodeDetector API if available
-    if ('BarcodeDetector' in window) {
-      const detector = new BarcodeDetector({ formats: ['ean_13', 'ean_8', 'upc_a', 'upc_e', 'code_128', 'code_39'] });
-      const video = document.getElementById('camera-video');
-      
-      barcodeScanner = setInterval(async () => {
-        if (video.readyState === video.HAVE_ENOUGH_DATA) {
-          try {
-            const barcodes = await detector.detect(video);
-            if (barcodes.length > 0) {
-              const code = barcodes[0].rawValue;
-              closeCamera();
-              openAddModal(code);
-            }
-          } catch {}
+  try {
+    // Stop any existing stream
+    if (cameraStream) { cameraStream.getTracks().forEach(t => t.stop()); cameraStream = null; }
+
+    // Use ZXing if available
+    if (typeof ZXing !== 'undefined') {
+      const hints = new Map();
+      const formats = [
+        ZXing.BarcodeFormat.EAN_13,
+        ZXing.BarcodeFormat.EAN_8,
+        ZXing.BarcodeFormat.UPC_A,
+        ZXing.BarcodeFormat.UPC_E,
+        ZXing.BarcodeFormat.CODE_128,
+        ZXing.BarcodeFormat.CODE_39,
+        ZXing.BarcodeFormat.QR_CODE,
+      ];
+      hints.set(ZXing.DecodeHintType.POSSIBLE_FORMATS, formats);
+      zxingReader = new ZXing.BrowserMultiFormatReader(hints);
+
+      // Get back camera on mobile
+      const devices = await ZXing.BrowserCodeReader.listVideoInputDevices();
+      const backCam = devices.find(d => /back|rear|environment/i.test(d.label)) || devices[devices.length - 1];
+      const deviceId = backCam ? backCam.deviceId : undefined;
+
+      await zxingReader.decodeFromVideoDevice(deviceId, video, (result, err) => {
+        if (result) {
+          const code = result.getText();
+          closeCamera();
+          openAddModal(code);
         }
-      }, 500);
+        // Ignore errors — ZXing fires continuously when no barcode found
+      });
+
+      // Keep a ref to the stream for cleanup
+      cameraStream = video.srcObject;
+
     } else {
-      // Fallback: manual entry inside camera modal
-      showToast('BarcodeDetector non supporté. Entre le code manuellement.', 'error');
-      setTimeout(() => {
-        closeCamera();
-        document.getElementById('barcode-input').focus();
-      }, 2500);
+      // Fallback: getUserMedia only (no decode)
+      cameraStream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' } });
+      video.srcObject = cameraStream;
+      showToast('Librairie non chargée, entre le code manuellement', 'error');
+      setTimeout(() => { closeCamera(); document.getElementById('barcode-input').focus(); }, 2500);
     }
   } catch (err) {
+    console.error('Camera error:', err);
     closeCamera();
-    showToast('Impossible d\'accéder à la caméra', 'error');
+    if (err.name === 'NotAllowedError') {
+      showToast('Accès caméra refusé — vérifie les réglages', 'error');
+    } else {
+      showToast('Impossible d\'accéder à la caméra', 'error');
+    }
   }
 }
 
 function closeCamera() {
-  if (barcodeScanner) { clearInterval(barcodeScanner); barcodeScanner = null; }
-  if (cameraStream) { cameraStream.getTracks().forEach(t => t.stop()); cameraStream = null; }
+  // Stop ZXing reader
+  if (zxingReader) { try { zxingReader.reset(); } catch {} zxingReader = null; }
+  // Stop raw stream
+  if (cameraStream) {
+    try {
+      const s = cameraStream instanceof MediaStream ? cameraStream : null;
+      if (s) s.getTracks().forEach(t => t.stop());
+    } catch {}
+    cameraStream = null;
+  }
+  const video = document.getElementById('camera-video');
+  if (video.srcObject) { try { video.srcObject.getTracks().forEach(t => t.stop()); } catch {} video.srcObject = null; }
   document.getElementById('camera-modal').classList.remove('open');
 }
 
